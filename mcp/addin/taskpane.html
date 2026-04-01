@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Track Changes Agent</title>
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" type="text/javascript"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 16px;
+      background: #fff;
+      color: #323130;
+    }
+    h2 { font-size: 15px; font-weight: 600; margin: 0 0 12px; }
+    #status {
+      padding: 8px 10px;
+      background: #f3f2f1;
+      border-radius: 4px;
+      margin-bottom: 12px;
+      color: #605e5c;
+    }
+    #status.active { background: #dff6dd; color: #107c10; }
+    #status.error  { background: #fde7e9; color: #a80000; }
+    #log { max-height: 400px; overflow-y: auto; }
+    .entry {
+      padding: 5px 0;
+      border-bottom: 1px solid #f3f2f1;
+      line-height: 1.4;
+    }
+    .entry.ok   { color: #107c10; }
+    .entry.miss { color: #a80000; }
+    .entry.info { color: #605e5c; }
+    .time { color: #c8c6c4; margin-right: 6px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h2>Track Changes Agent</h2>
+  <div id="status">Connecting…</div>
+  <div id="log"></div>
+
+  <script>
+    const apiBase = window.location.origin;
+    let busy = false;
+    let currentUrl = null;
+
+    Office.onReady(async () => {
+      log('Add-in ready — polling for changes', 'info');
+      await registerDocument();
+      tick();
+    });
+
+    async function registerDocument() {
+      try {
+        // Office.context.document.url is the most reliable way to get the SharePoint URL
+        // in both Word Online and Word Desktop.
+        let url = Office.context.document.url || null;
+
+        if (!url) {
+          // Secondary fallback: try document properties serverUrl (desktop Word)
+          await Word.run(async (context) => {
+            const props = context.document.properties;
+            context.load(props, 'serverUrl');
+            await context.sync();
+            url = props.serverUrl || null;
+          });
+        }
+
+        if (!url) {
+          log('Could not determine document URL — make sure the document is saved to SharePoint/OneDrive', 'miss');
+          setStatus('Document URL not found', 'error');
+          return;
+        }
+
+        await fetch(apiBase + '/current-document', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sharepoint_url: url }),
+        });
+        currentUrl = url;
+        log('Document registered: ' + url.slice(0, 60) + '…', 'info');
+        await pushDocumentContent();
+      } catch (e) {
+        log('Could not register document: ' + e.message, 'miss');
+      }
+    }
+
+    async function pushDocumentContent() {
+      if (!currentUrl) return;
+      try {
+        const paragraphs = [];
+        await Word.run(async (context) => {
+          const paras = context.document.body.paragraphs;
+          context.load(paras, 'items');
+          await context.sync();
+          paras.items.forEach(p => context.load(p, 'text,style'));
+          await context.sync();
+          // Include ALL paragraphs (even empty ones) so the agent can see and delete them.
+          // empty: true marks paragraphs with no visible text.
+          paras.items.forEach((p, i) => {
+            paragraphs.push({ index: i, style: p.style, content: p.text, empty: !p.text.trim() });
+          });
+        });
+        await fetch(apiBase + '/document-content', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sharepoint_url: currentUrl, paragraphs }),
+        });
+        log('Document content pushed (' + paragraphs.length + ' paragraphs)', 'info');
+      } catch (e) {
+        log('Could not push document content: ' + e.message, 'miss');
+      }
+    }
+
+    function tick() { setTimeout(poll, 3000); }
+
+    async function poll() {
+      if (busy) { tick(); return; }
+      busy = true;
+      try {
+        const res = await fetch(apiBase + '/pending-changes');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const { changes, needs_refresh } = await res.json();
+        if (needs_refresh) {
+          log('Refresh requested — re-pushing document content…', 'info');
+          await pushDocumentContent();
+        }
+        if (changes.length > 0) {
+          setStatus('Applying ' + changes.length + ' change set(s)…', 'active');
+          for (const change of changes) await applyChange(change);
+          setStatus('Done — polling for changes…', '');
+        }
+      } catch (e) {
+        setStatus('Error: ' + e.message, 'error');
+      } finally {
+        busy = false;
+        tick();
+      }
+    }
+
+    function changeLabel(c) {
+      const action = c.action || 'replace';
+      if (action === 'delete') return 'delete para ' + c.paragraph_index;
+      if (action === 'insert_after') return 'insert after para ' + c.paragraph_index + ': "' + shorten(c.new_text) + '"';
+      return c.old_text
+        ? 'para ' + c.paragraph_index + ' "' + shorten(c.old_text) + '" → "' + shorten(c.new_text) + '"'
+        : 'para ' + c.paragraph_index + ' → "' + shorten(c.new_text) + '"';
+    }
+
+    async function applyChange(change) {
+      if (change.changes) {
+        for (const c of change.changes) {
+          const ok = await applyEdit(c.paragraph_index, c.action || 'replace', c.new_text || null, c.old_text || null, c.style || null);
+          log((ok ? '✓ ' : '✗ ') + changeLabel(c), ok ? 'ok' : 'miss');
+        }
+      }
+      await fetch(apiBase + '/pending-changes/' + change.id + '/done', { method: 'POST' });
+    }
+
+    async function applyEdit(index, action, newText, oldText, style) {
+      let found = false;
+      await Word.run(async (context) => {
+        context.document.changeTrackingMode = Word.ChangeTrackingMode.trackAll;
+        const paragraphs = context.document.body.paragraphs;
+        context.load(paragraphs, 'items');
+        await context.sync();
+        if (index >= 0 && index < paragraphs.items.length) {
+          found = await dispatchEdit(context, paragraphs.items[index], action, newText, oldText, style);
+        }
+      });
+      return found;
+    }
+
+    async function dispatchEdit(context, para, action, newText, oldText, style) {
+      if (action === 'delete') {
+        para.delete();
+        await context.sync();
+        return true;
+      }
+      if (action === 'insert_after') {
+        return insertLines(context, para, newText.split('\n').filter(l => l !== ''), style);
+      }
+      // replace
+      if (oldText) return replaceInline(context, para, oldText, newText);
+      return replaceParagraph(context, para, newText, style);
+    }
+
+    async function insertLines(context, anchor, lines, style) {
+      for (const line of lines) {
+        const p = anchor.insertParagraph(line, 'After');
+        if (style) p.style = style;
+        anchor = p;
+      }
+      await context.sync();
+      return true;
+    }
+
+    async function replaceInline(context, para, oldText, newText) {
+      const hits = para.search(oldText, { matchCase: false, matchWholeWord: false });
+      context.load(hits, 'items');
+      await context.sync();
+      if (hits.items.length === 0) return false;
+      hits.items[0].insertText(newText, 'Replace');
+      await context.sync();
+      return true;
+    }
+
+    async function replaceParagraph(context, para, newText, style) {
+      const lines = newText.split('\n').filter(l => l !== '');
+      para.insertText(lines[0] ?? newText, 'Replace');
+      if (style) para.style = style;
+      if (lines.length > 1) {
+        await context.sync();
+        let anchor = para;
+        for (let i = 1; i < lines.length; i++) {
+          const p = anchor.insertParagraph(lines[i], 'After');
+          if (style) p.style = style;
+          anchor = p;
+        }
+      }
+      await context.sync();
+      return true;
+    }
+
+    function setStatus(msg, type) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = type || '';
+    }
+
+    function log(msg, type) {
+      const now = new Date().toLocaleTimeString();
+      const div = document.createElement('div');
+      div.className = 'entry ' + (type || 'info');
+      div.innerHTML = '<span class="time">' + now + '</span>' + esc(msg);
+      document.getElementById('log').prepend(div);
+    }
+
+    function shorten(s) { return s.length > 35 ? s.slice(0, 35) + '…' : s; }
+    function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  </script>
+</body>
+</html>
