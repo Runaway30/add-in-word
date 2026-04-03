@@ -322,6 +322,11 @@ async def receive_document_content(request: Request) -> JSONResponse:
     url = body.get("sharepoint_url")
     paragraphs = body.get("paragraphs", [])
     if url:
+        # Strip Word control characters (field codes, etc.) that confuse LLMs
+        import re as _re
+        for p in paragraphs:
+            if "content" in p:
+                p["content"] = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", p["content"])
         _document_cache[url] = {
             "paragraphs": paragraphs,
             "paragraph_count": len(paragraphs),

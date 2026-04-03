@@ -5,11 +5,17 @@
   xsi:type="TaskPaneApp">
 
   <Id>6f8a3c2e-9b4d-4f1a-8e7c-d2b5a6f3e801</Id>
-  <Version>1.0.0</Version>
+  <Version>1.0.1</Version>
   <ProviderName>word-mcp</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="Track Changes Agent" />
   <Description DefaultValue="Applies AI-suggested track changes from the MCP server live in Word." />
+  <IconUrl DefaultValue="https://placehold.co/32x32.png" />
+  <HighResolutionIconUrl DefaultValue="https://placehold.co/64x64.png" />
+  <SupportUrl DefaultValue="{{SERVER_URL}}" />
+  <AppDomains>
+    <AppDomain>{{SERVER_URL}}</AppDomain>
+  </AppDomains>
 
   <Hosts>
     <Host Name="Document" />
